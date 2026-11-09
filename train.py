@@ -1,416 +1,137 @@
-import os
-import sys
-
-from tools.all_tools import attach_meta, parse_args
-from tools.train_semi import train_start_semi
-from tools.train_semi1 import train_start_semi1
-from tools.train_semi2 import train_start_semi2
-from tools.train_semi3 import train_start_semi3
-from tools.train_semi4 import train_start_semi4
-from tools.train_sup import train_start_supervised
-from mmocr.core.optimizer.builder import build_optimizer
-# Ensure project root is on sys.path when running this file directly (python ./tools/train.py)
-# So that imports like `from tools.simple_train import ...` work.
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
-#!/usr/bin/env python
+#!/usr/bin/env python3
+"""Train RPS with user-provided image manifests and cached OCR boxes."""
+import argparse
+import copy
+import hashlib
 import json
-import torch
-import numpy as np
-import os, os.path as osp, pickle, time
-from torch.utils.data import Dataset
-import numpy as np
-from mmcv import Config
-from mmcv.runner import  set_random_seed
-from mmdet.datasets import (build_dataloader)
-from mmocr.models import build_detector
-from torch.utils.data import Subset
+import os
+from pathlib import Path
+import random
 
-torch.multiprocessing.set_start_method('fork')
+os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
 
-# ================== 默认训练配置 ==================
-DEFAULT_CONFIG_PATH = '/workspace/MASA/config/config_fintabnet.py'
-DEFAULT_WORK_DIR = './output_fintabnet/' #结果输出路径
-# DEFAULT_SEED = 123              # 或者 None
-# =================================================
 
-_BASE_DS_CACHE = None  # 进程内复用
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--config', default=str(Path(__file__).parent/'configs/rps.py'))
+    parser.add_argument('--labeled', help='JSONL manifest for labeled training images')
+    parser.add_argument('--unlabeled', help='JSONL manifest for unlabeled training images')
+    parser.add_argument('--val', help='JSONL manifest for validation images')
+    parser.add_argument('--image-root', default='.')
+    parser.add_argument('--ocr-cache', help='Offline boxes_xyxy_480 JSONL cache')
+    parser.add_argument('--work-dir', default='runs/rps')
+    parser.add_argument('--pretrained', help='Supervised model initialization checkpoint')
+    parser.add_argument('--resume', help='Full RPS training checkpoint')
+    parser.add_argument('--seed', type=int, help='User-selected random seed')
+    parser.add_argument('--epochs', type=int, help='Total optimization schedule in epochs')
+    parser.add_argument('--stop-after-epoch', type=int, default=0)
+    parser.add_argument('--mode', choices=['semi','supervised'], default='semi')
+    parser.add_argument('--check-config', action='store_true', help='Validate configuration without loading data')
+    return parser.parse_args()
 
-# ---- 把 flag / CLASSES / PALETTE 等元信息转接到 Subset 上 ----
 
-class RepeatDataset(Dataset):
-    def __init__(self, dataset, times):
-        self.dataset = dataset
-        self.times = int(times)
-        self._len = len(dataset) * self.times
+def sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for block in iter(lambda:stream.read(1024*1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
 
-        # 处理 flag（给 GroupSampler 用）
-        if hasattr(dataset, 'flag'):
-            f = np.asarray(dataset.flag)
-            self.flag = np.tile(f, self.times)
-
-    def __len__(self):
-        return self._len
-
-    def __getitem__(self, idx):
-        return self.dataset[idx % len(self.dataset)]
-
-def run_training_by_cfg(model, data_loaders_labeled, data_loaders_unlabeled, data_loaders_val, cfg):
-    # 每次训练都重新 build optimizer（强烈建议）
-    optimizer = build_optimizer(model, cfg.optimizer)
-
-    mode = str(getattr(cfg, "train_mode", "supervised")).lower()
-    print(f"[RUN] train_mode = {mode}")
-
-    if mode in ("supervised", "sup", "s"):
-        train_start_supervised(
-            model,
-            data_loaders_labeled,
-            data_loaders_val,
-            optimizer,
-            cfg
-        )
-
-    elif mode in ("semi", "semisupervised", "semi_supervised", "ssl"):
-        train_start_semi4(
-            model,
-            data_loaders_labeled,
-            data_loaders_unlabeled,
-            data_loaders_val,
-            optimizer,
-            cfg
-        )
-
-    else:
-        raise ValueError(f"Unknown cfg.train_mode={mode}. Use 'supervised' or 'semi'.")
 
 def main():
     args = parse_args()
-
+    from rps.runtime import Config
     cfg = Config.fromfile(args.config)
-    if args.cfg_options is not None:
-        cfg.merge_from_dict(args.cfg_options)
+    cfg.train_mode = args.mode
+    if args.epochs is not None:
+        if args.epochs < 1:
+            raise ValueError('--epochs must be positive.')
+        cfg.semi_epochs = cfg.sup_epochs = args.epochs
+    if args.check_config:
+        print(json.dumps(dict(config=str(Path(args.config).resolve()), decoder_layers=cfg.model.decoder.N,
+                              max_sequence_length=cfg.model.max_seq_len, image_size=cfg.image_size,
+                              epochs=cfg.semi_epochs, spp_pairs=cfg.boxswap_pairs), indent=2))
+        return
+    required = ['labeled','val'] + (['unlabeled','ocr_cache'] if args.mode=='semi' else [])
+    if any(getattr(args, name) is None for name in required):
+        raise ValueError('Required arguments: '+', '.join('--'+name.replace('_','-') for name in required))
+    if args.resume and args.pretrained:
+        raise ValueError('Use either --resume or --pretrained.')
 
-    if args.mc_config:
-        mc = Config.fromfile(args.mc_config)
-        if isinstance(cfg.data.train, list):
-            for i in range(len(cfg.data.train)):
-                cfg.data.train[i].pipeline[0].update(
-                    file_client_args=mc['mc_file_client_args'])
-        else:
-            cfg.data.train.pipeline[0].update(
-                file_client_args=mc['mc_file_client_args'])
+    import numpy as np
+    import torch
+    from rps.models import build_model
+    from rps.data import TableDataset, make_loader, check_disjoint
+    from rps.optim import Ranger
+    from rps.augment import OCRBoxCache
+    from rps.engine.trainer import train
 
-    if cfg.get('custom_imports', None):
-        from mmcv.utils import import_modules_from_strings
-        import_modules_from_strings(**cfg['custom_imports'])
-    #print("import modules from string list.")
-
-    # set cudnn_benchmark
-    if cfg.get('cudnn_benchmark', False):
-        torch.backends.cudnn.benchmark = True
-
-    if args.work_dir is not None:
-        # update configs according to CLI args if args.work_dir is not None
-        cfg.work_dir = args.work_dir
-    elif cfg.get('work_dir', None) is None:
-        # use config filename as default work_dir if cfg.work_dir is None
-        cfg.work_dir = osp.join('work_dirs', osp.splitext(osp.basename(args.config))[0])
-    if args.load_from is not None:
-        cfg.load_from = args.load_from
-    if args.resume_from is not None:
-        cfg.resume_from = args.resume_from
-    if args.gpu_ids is not None:
-        cfg.gpu_ids = args.gpu_ids
+    saved_identity = None
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location='cpu')
+        saved_identity = checkpoint['training_state']['identity']
+        seed = saved_identity['seed']
+        if args.seed is not None and args.seed != seed:
+            raise ValueError('The requested seed differs from the resumed run.')
+        del checkpoint
     else:
-        cfg.gpu_ids = range(1) if args.gpus is None else range(args.gpus)
+        seed = args.seed if args.seed is not None else int.from_bytes(os.urandom(4), 'little')
+    if not 0 <= seed < 2**32:
+        raise ValueError('Seed must be an unsigned 32-bit integer.')
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    cfg.seed = seed
+    cfg.work_dir = str(Path(args.work_dir).resolve())
+    cfg.pretrained = str(Path(args.pretrained).resolve()) if args.pretrained else None
+    cfg.resume_from = str(Path(args.resume).resolve()) if args.resume else None
+    cfg.stop_after_epoch = args.stop_after_epoch
+    cfg.ocr_jsonl_trainpad = str(Path(args.ocr_cache).resolve()) if args.ocr_cache else None
 
-    # init distributed env first, since logger depends on the dist info.
-    distributed = False
-    if args.seed is not None:
-        set_random_seed(args.seed, deterministic=args.deterministic)
-    cfg.seed = args.seed
-
-    # ----------------------加载模型 -------------------------
-    model = build_detector(cfg.model,train_cfg=cfg.get('train_cfg'),test_cfg=cfg.get('test_cfg'))
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f'Total: {total_params / 1e6:.2f} M')
-
-    #---------------------- 加载预训练模型参数 ------------------
-    pretrained = getattr(cfg, "pretrained", None)
-    resume_from = getattr(cfg, "resume_from", None)
-    load_from = getattr(cfg, "load_from", None)
-
-    if resume_from:
-        print(f"[CFG] resume_from = {resume_from}")
-    elif load_from:
-        print(f"[CFG] load_from = {load_from}")
-    elif pretrained:
-        print(f"[CFG] pretrained = {pretrained}")
+    labeled = TableDataset(args.labeled, args.image_root, cfg.image_size)
+    validation = TableDataset(args.val, args.image_root, cfg.image_size)
+    unlabeled = TableDataset(args.unlabeled, args.image_root, cfg.image_size, labeled=False) if args.unlabeled else labeled
+    if args.mode=='semi':
+        check_disjoint(labeled,unlabeled,validation)
+        cache=OCRBoxCache(cfg.ocr_jsonl_trainpad)
+        coverage=sum(bool(cache.get_boxes(str(unlabeled.path(r)))) for r in unlabeled.records)
+        if not coverage:
+            raise ValueError('The OCR cache has no boxes for the unlabeled manifest.')
+        print('OCR box coverage: {}/{}'.format(coverage,len(unlabeled)))
+        del cache
     else:
-        print('ℹ No pretrained specified or file not found, training from scratch.')
-    # ------------------------------------------------
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f'Total: {total_params / 1e6:.2f} M')
-
-    # ======================================================================
-    # =========================== 数据集 & 划分加载 ===========================
-    # ======================================================================
-
-    print("=== Start building datasets with base_dataset.pkl + stats.json ===")
-    global_start = time.time()
-
-    # ---------------- 1) 准备 base_dataset（只构造 / 反序列化一次） ----------------
-    # 1) 训练集路径以及划分准备
-    base_pkl_path_train = getattr(cfg, 'base_pkl_path_train')  # 你之前保存的路径
-    split_dir_train = getattr(cfg, 'split_dir_train')  # 注意和你磁盘上的目录一致
-
-    if osp.exists(base_pkl_path_train):
-        print(f"load base_dataset from {base_pkl_path_train}")
-        with open(base_pkl_path_train, 'rb') as f:
-            base_dataset_train = pickle.load(f)
-    else:
-        msg = f"[ERROR] base_dataset pkl not exist：{base_pkl_path_train}\n"
-        print(msg)
-        raise FileNotFoundError(msg)
-
-    # 2) 验证集路径以及划分准备
-    base_pkl_path_val = getattr(cfg, 'base_pkl_path_val')  # 你之前保存的路径
-    split_dir_val = getattr(cfg, 'split_dir_val')  # 注意和你磁盘上的目录一致
-
-    if osp.exists(base_pkl_path_val):
-        print(f"load base_dataset from {base_pkl_path_val}")
-        with open(base_pkl_path_val, 'rb') as f:
-            base_dataset_val = pickle.load(f)
-    else:
-        msg = f"[ERROR] base_dataset pkl not exist：{base_pkl_path_val}\n"
-        print(msg)
-        raise FileNotFoundError(msg)
+        names={str(labeled.path(r).resolve()) for r in labeled.records}
+        if names & {str(validation.path(r).resolve()) for r in validation.records}:
+            raise ValueError('Training and validation image lists must be disjoint.')
+        cfg.use_spp=False
+        cfg.sup_only_epochs=cfg.sup_epochs
+    sup_loader=make_loader(labeled,cfg.sup_bs,seed)
+    unsup_loader=make_loader(unlabeled,cfg.unsup_bs,seed)
+    val_loader=make_loader(validation,cfg.val_bs,seed,shuffle=False)
+    cfg.sup_steps_per_epoch=len(sup_loader)
+    cfg.unsup_target_updates=int(cfg.unsup_steps_per_epoch)
+    if args.mode=='semi' and len(unsup_loader)<cfg.unsup_target_updates:
+        raise ValueError('The unlabeled manifest supplies fewer batches than unsup_steps_per_epoch; configure the per-epoch budget for this manifest.')
+    config_identity=cfg.to_dict()
+    for name in ['seed','work_dir','pretrained','resume_from','stop_after_epoch']:
+        config_identity.pop(name,None)
+    config_identity['model']['label_convertor']['dict_file']=sha256(cfg.model.label_convertor.dict_file)
+    config_identity['model']['label_convertor']['cell_dict_file']=sha256(cfg.model.label_convertor.cell_dict_file)
+    config_identity['label_convertor']['dict_file']=sha256(cfg.label_convertor.dict_file)
+    config_identity['label_convertor']['cell_dict_file']=sha256(cfg.label_convertor.cell_dict_file)
+    identity=dict(seed=seed,run_directory=cfg.work_dir,mode=args.mode,
+                  config_sha256=hashlib.sha256(json.dumps(config_identity,sort_keys=True).encode()).hexdigest(),
+                  labeled_sha256=sha256(args.labeled),validation_sha256=sha256(args.val),
+                  unlabeled_sha256=sha256(args.unlabeled) if args.unlabeled else None,
+                  ocr_sha256=sha256(args.ocr_cache) if args.ocr_cache else None)
+    if saved_identity is not None and identity!=saved_identity:
+        raise ValueError('Configuration, data manifests, OCR cache, or output directory differs from the resumed run.')
+    cfg.training_identity=identity
+    model=build_model(cfg.model)
+    optimizer_cfg=dict(cfg.optimizer); optimizer_cfg.pop('type')
+    optimizer=Ranger(model.parameters(),**optimizer_cfg)
+    train(model,[sup_loader],[unsup_loader],[val_loader],optimizer,cfg)
 
 
-    print("start base dataset")
-    start_time = time.time()
-
-    base_len_train = len(base_dataset_train)
-    base_len_val = len(base_dataset_val)
-    end_time = time.time()
-    print(f"base_dataset_train length: {base_len_train}")
-    print(f"base_dataset_val length: {base_len_val}")
-    print(f"base dataset 准备耗时: {end_time - start_time:.2f} 秒")
-
-    # ---------------- 2) 读取划分信息 stats.json ----------------
-    # 从 cfg 中读取 split_dir（stats.json 所在目录），否则使用原默认
-    os.makedirs(split_dir_train, exist_ok=True)
-    stats_path_train = osp.join(split_dir_train, 'stats.json')
-
-    os.makedirs(split_dir_val, exist_ok=True)
-    stats_path_val = osp.join(split_dir_val, 'val_fast.json')
-
-    with open(stats_path_train, 'r') as f:
-        stats_train = json.load(f)
-    with open(stats_path_val, 'r') as f:
-        stats_val = json.load(f)
-
-    labeled_indices = stats_train['labeled_indices']
-    unlabeled_indices = stats_train['unlabeled_indices']
-    val_indices = stats_val['val_fast_indices']
-
-    print(f"labeled_indices   数量: {len(labeled_indices)}")
-    print(f"unlabeled_indices 数量: {len(unlabeled_indices)}")
-    print(f"val_indices      数量: {len(val_indices)}")
-
-    # ---------------- 3) 用 Subset 构造三个子集（极轻量） ----------------
-    print("build Subset datasets ...")
-    start_time = time.time()
-
-    dataset_labeled = Subset(base_dataset_train, labeled_indices)
-    dataset_unlabeled = Subset(base_dataset_train, unlabeled_indices)
-    dataset_val = Subset(base_dataset_val, val_indices)
-
-    attach_meta(dataset_labeled, labeled_indices, base_dataset_train)
-    attach_meta(dataset_unlabeled, unlabeled_indices, base_dataset_train)
-    attach_meta(dataset_val, val_indices, base_dataset_val)
-
-    end_time = time.time()
-    print(f"build Subset 耗时: {end_time - start_time:.2f} 秒")
-
-    # ======================================================================
-    # =========================== Dataloader 构造 ===========================
-    # ======================================================================
-    # 1) 有标签数据
-    print("Preparing labeled dataloader......")
-    start_time = time.time()
-    data_loader_labeled = build_dataloader(
-        dataset_labeled,
-        cfg.sup_bs,
-        cfg.data.workers_per_gpu,
-        len(cfg.gpu_ids),
-        dist=distributed,
-        seed=cfg.seed
-    )
-    data_loaders_labeled = [data_loader_labeled]
-    end_time = time.time()
-    print(f"labeled dataloader 耗时: {end_time - start_time:.2f} 秒")
-
-    # 2) 无标签数据
-    print("Preparing unlabeled dataloader......")
-    start_time = time.time()
-    data_loader_unlabeled = build_dataloader(
-        dataset_unlabeled,
-        cfg.unsup_bs,
-        cfg.data.workers_per_gpu,
-        len(cfg.gpu_ids),
-        dist=distributed,
-        seed=cfg.seed
-    )
-    data_loaders_unlabeled = [data_loader_unlabeled]
-    end_time = time.time()
-    print(f"unlabeled dataloader 耗时: {end_time - start_time:.2f} 秒")
-
-    # 3) 验证集数据
-    print("Preparing val dataloader......")
-    start_time = time.time()
-    data_loader_val = build_dataloader(
-        dataset_val,
-        cfg.val_bs,
-        cfg.data.workers_per_gpu,
-        len(cfg.gpu_ids),
-        dist=distributed,
-        seed=cfg.seed
-    )
-
-    data_loaders_val = [data_loader_val]
-    end_time = time.time()
-    print(f"val dataloader 耗时: {end_time - start_time:.2f} 秒")
-
-    global_end = time.time()
-    print(f"=== 数据集+loader 总耗时: {global_end - global_start:.2f} 秒 ===")
-
-    # ======================================================================
-    # ============================== 调用训练 ===============================
-    # ======================================================================
-
-    del base_dataset_train
-    del base_dataset_val
-    del stats_train, stats_val
-    del labeled_indices, unlabeled_indices, val_indices
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = model.to(device)
-
-    run_training_by_cfg(
-        model,
-        data_loaders_labeled,
-        data_loaders_unlabeled,
-        data_loaders_val,
-        cfg
-    )
-
-
-
-
-
-
-
-
-
-
-    # # ======================================================================
-    # # =========================== 有标签数据准备 ============================
-    # # ======================================================================
-    # print("strat labeled dataset")
-    # start_time = time.time()
-    # os.makedirs('cache', exist_ok=True)
-    # if osp.exists('cache/spilt_test/ratio_10_90/labeled_with_flag.pkl'):
-    #     with open('cache/spilt_test/ratio_10_90/labeled_with_flag.pkl', 'rb') as f:
-    #         dataset = pickle.load(f)
-    # else:
-    #     dataset = build_dataset(cfg.data.train)
-    #     with open('cache/spilt_test/ratio_10_90/labeled_with_flag.pkl', 'wb') as f:
-    #         pickle.dump(dataset, f)
-    # datasets_labeled = [dataset]
-    # print("Preparing labeled dataloader......")
-    # data_loaders_labeled = [
-    #     build_dataloader(
-    #         ds,
-    #         cfg.data.samples_per_gpu,
-    #         cfg.data.workers_per_gpu,
-    #         len(cfg.gpu_ids),
-    #         dist=distributed,
-    #         seed=cfg.seed) for ds in datasets_labeled
-    # ]
-    # end_time = time.time()
-    # print(f"labeled dataset 耗时: {end_time - start_time:.2f} 秒")
-    # #
-    #
-    # # ======================================================================
-    # # =========================== 无标签数据准备 ============================
-    # # ======================================================================
-    # print("strat unlabeled dataset")
-    # start_time = time.time()
-    # os.makedirs('cache', exist_ok=True)
-    # if osp.exists('cache/spilt1000/ratio_10_80_10/unlabeled_with_flag.pkl'):
-    #     with open('cache/spilt1000/ratio_10_80_10/unlabeled_with_flag.pkl', 'rb') as f:
-    #         dataset = pickle.load(f)
-    # else:
-    #     dataset = build_dataset(cfg.data.train)
-    #     with open('cache/spilt1000/ratio_10_80_10/unlabeled_with_flag.pkl', 'wb') as f:
-    #         pickle.dump(dataset, f)
-    # datasets_unlabeled = [dataset]
-    # print("Preparing unlabeled dataloader......")
-    # data_loaders_unlabeled = [
-    #     build_dataloader(
-    #         ds,
-    #         cfg.data.samples_per_gpu,
-    #         cfg.data.workers_per_gpu,
-    #         len(cfg.gpu_ids),
-    #         dist=distributed,
-    #         seed=cfg.seed) for ds in datasets_unlabeled
-    # ]
-    # end_time = time.time()
-    # print(f"unlabeled dataset 耗时: {end_time - start_time:.2f} 秒")
-    #
-    #
-    # # ======================================================================
-    # # =========================== 预测集数据准备 ============================
-    # # ======================================================================
-    # print("strat val dataset")
-    # start_time = time.time()
-    # os.makedirs('cache', exist_ok=True)
-    # if osp.exists('cache/spilt_test/ratio_10_90/labeled_with_flag.pkl'):
-    #     with open('cache/spilt_test/ratio_10_90/labeled_with_flag.pkl', 'rb') as f:
-    #         dataset = pickle.load(f)
-    # else:
-    #     dataset = build_dataset(cfg.data.train)
-    #     with open('cache/spilt_test/ratio_10_90/labeled_with_flag.pkl', 'wb') as f:
-    #         pickle.dump(dataset, f)
-    # datasets_val = [dataset]
-    # print("Preparing val dataloader......")
-    # data_loaders_val= [
-    #     build_dataloader(
-    #         ds,
-    #         cfg.data.samples_per_gpu,
-    #         cfg.data.workers_per_gpu,
-    #         len(cfg.gpu_ids),
-    #         dist=distributed,
-    #         seed=cfg.seed) for ds in datasets_val
-    # ]
-    # end_time = time.time()
-    # print(f"val dataset 耗时: {end_time - start_time:.2f} 秒")
-    #
-    #
-    # # ======================================================================
-    # # ============================== 调用训练 ===============================
-    # # ======================================================================
-    # optimizer = build_optimizer(model, cfg.optimizer)
-    # #
-    # del datasets_unlabeled,datasets_labeled,datasets_val
-    # train_start(model,data_loaders_labeled,data_loaders_unlabeled,data_loaders_val,optimizer,cfg)
-    #
-    # del datasets_labeled, datasets_val
-    # train_overfit_one_image(model,data_loaders_val,data_loaders_val,optimizer,cfg)
-
-if __name__ == '__main__':
+if __name__=='__main__':
     main()
